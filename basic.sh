@@ -2,6 +2,9 @@
 
 
 ## Windows
+python3 clipboard_share_qt.py --secret changeme
+
+
 python3 clipboard_share_qt.py 
 pip3 install PySide6 -i https://pypi.tuna.tsinghua.edu.cn/simple
 
