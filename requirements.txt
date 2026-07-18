@@ -1,0 +1,5 @@
+# Qt 版 (推荐, 支持文本+图片+托盘图标)
+PySide6
+
+# 轻量 CLI 版只需要:
+pyperclip
