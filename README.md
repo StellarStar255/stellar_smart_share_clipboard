@@ -9,13 +9,25 @@
 
 ```bash
 pip install -r requirements.txt
-
-# Qt 版 (推荐): 支持文本 + 图片, 事件驱动监听, 系统托盘图标
 python clipboard_share_qt.py
-
-# 或轻量 CLI 版: 仅文本, 只依赖 pyperclip
-python clipboard_share.py
 ```
+
+支持文本 + 图片同步, 主窗口显示在线节点与同步记录, 关闭窗口后
+最小化到系统托盘继续后台运行。
+
+### Windows 上安装 PySide6 失败?
+
+- `DLL load failed while importing QtCore`: 先安装
+  [VC++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe);
+  conda 环境下建议 `conda install -c conda-forge pyside6`
+- `No such file or directory: ...qml\...obj` (商店版 Python 长路径问题):
+  以管理员运行 PowerShell 执行下面命令后重启电脑, 再
+  `pip uninstall -y PySide6 PySide6_Essentials PySide6_Addons shiboken6`
+  清理残留并重新 `pip install PySide6`:
+
+  ```powershell
+  New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+  ```
 
 启动后会自动发现同网段的其他实例, 之后在任一台电脑复制的内容都会
 出现在其他电脑的剪贴板中。

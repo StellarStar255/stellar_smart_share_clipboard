@@ -80,6 +80,19 @@ class SyncEngine:
         self.paused = False
 
     def start(self):
+        """先在主线程绑定端口, 失败时抛出带清晰提示的异常。"""
+        try:
+            self._disc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._disc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._disc_sock.bind(("", DISCOVERY_PORT))
+            self._srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._srv_sock.bind(("", TRANSFER_PORT))
+            self._srv_sock.listen(8)
+        except OSError as e:
+            raise RuntimeError(
+                f"端口被占用 (UDP {DISCOVERY_PORT} / TCP {TRANSFER_PORT})。\n"
+                f"本机可能已经运行了一个剪贴板同步实例, 请先关闭它。\n\n{e}")
         for target in (self._announce_loop, self._discovery_loop,
                        self._server_loop):
             threading.Thread(target=target, daemon=True).start()
@@ -113,9 +126,7 @@ class SyncEngine:
             time.sleep(ANNOUNCE_INTERVAL)
 
     def _discovery_loop(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", DISCOVERY_PORT))
+        sock = self._disc_sock
         while True:
             try:
                 data, addr = sock.recvfrom(4096)
@@ -145,10 +156,7 @@ class SyncEngine:
     # ---- 接收 ----
 
     def _server_loop(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("", TRANSFER_PORT))
-        srv.listen(8)
+        srv = self._srv_sock
         while True:
             conn, addr = srv.accept()
             threading.Thread(target=self._handle_incoming,
@@ -383,7 +391,12 @@ class App:
         self.tray.setToolTip(f"Stellar 剪贴板同步 — {len(ips)} 节点在线")
 
     def run(self) -> int:
-        self.engine.start()
+        try:
+            self.engine.start()
+        except RuntimeError as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(None, "无法启动", str(e))
+            return 1
         self.window.show()
         self.window.append_log(f"已启动, 本机节点 {NODE_ID[:8]}")
         self.window.append_log("等待发现同网段节点…")
