@@ -145,6 +145,33 @@ class TestHelpers(unittest.TestCase):
             self.assertEqual([read_bytes(p) for p in paths],
                              [b"1", b"2", b"3"])
 
+    def test_file_echo_detects_synergy_clobber(self):
+        names = {"报告.md", "b.bin"}
+        paths = {"/home/u/docs/报告.md", "/home/u/docs/b.bin"}
+        # Nautilus 文本影子: 完整路径, 多行
+        self.assertTrue(m._is_file_echo(
+            "/home/u/docs/报告.md\n/home/u/docs/b.bin\n", names, paths))
+        # Finder 文本影子: 只有文件名
+        self.assertTrue(m._is_file_echo("报告.md\r\nb.bin", names, paths))
+        # file:// URL 形式 (中文被百分号编码)
+        self.assertTrue(m._is_file_echo(
+            "file:///home/u/docs/%E6%8A%A5%E5%91%8A.md", names, paths))
+        # 对端机器上的不同路径, 但文件名对得上
+        self.assertTrue(m._is_file_echo(
+            "C:\\Users\\x\\Desktop\\b.bin", names, paths))
+
+    def test_file_echo_rejects_real_text(self):
+        names = {"报告.md"}
+        paths = {"/home/u/docs/报告.md"}
+        self.assertFalse(m._is_file_echo("随便一段话", names, paths))
+        # 只要有一行对不上就不是影子
+        self.assertFalse(m._is_file_echo(
+            "/home/u/docs/报告.md\n还有别的内容", names, paths))
+        self.assertFalse(m._is_file_echo("", names, paths))
+        self.assertFalse(m._is_file_echo("  \n  ", names, paths))
+        # 路径的父目录同名文件不算
+        self.assertFalse(m._is_file_echo("/etc/passwd", names, paths))
+
     def test_safe_decompress(self):
         self.assertEqual(m._safe_decompress(zlib.compress(b"abc")), b"abc")
         self.assertIsNone(m._safe_decompress(b"not-zlib"))

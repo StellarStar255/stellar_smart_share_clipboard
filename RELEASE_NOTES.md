@@ -1,48 +1,41 @@
-# Stellar Clipboard v2.2.0
+# Stellar Clipboard v2.2.1
 
 ## 中文
 
-新增文件同步。
+修复:与 Synergy / NoMachine 等键鼠共享软件共存时,文件同步失效。
 
-- **复制文件,直接粘贴**:在一台电脑复制文件(⌘C / Ctrl+C),到另
-  一台直接粘贴(⌘V / Ctrl+V),粘出来的就是真正的文件;支持一次
-  复制多个文件
-- 单次总大小上限 64MB;暂不支持文件夹(会在日志中提示跳过),
-  文件夹请先压缩成 zip 再复制
-- 发送前按文件大小预检,超限的大文件不会被读进内存;接收的文件
-  在网络线程落盘,不卡界面
-- 收到的文件写入临时目录的独立子目录(同名文件自动加序号),
-  文件名经过清洗,防止路径穿越
-- 测试套件扩充到 23 个用例,覆盖文件打包/解包/落盘/超限拒发
+- 这类软件自带的剪贴板同步不支持文件:切换屏幕时会把"复制的文件"
+  降级成路径文本,覆盖本程序刚写入对端剪贴板的文件,导致粘贴无反应
+- 现在两端都会记住最近一批同步过的文件;一旦剪贴板被覆盖成对应的
+  路径文本,立即识别并把文件恢复回剪贴板(日志中会提示),同时不把
+  这段路径文本误当作复制的文字广播出去
+- 识别规则:纯文本、每一行都能对应到批内文件(完整路径 / file://
+  URL / 文件名),距最近一次文件同步不超过 10 分钟;正常复制的文字
+  不受影响
+- 测试套件扩充到 25 个用例
 
-注意:文件同步使用了新的消息类型,2.1.0 及更早版本会忽略这类消息。
-新旧版本混跑期间,文件无法同步到旧版(文本和图片不受影响),请把
-所有机器都升级到 2.2.0。
-
-从 v2.1.x 升级为全自动流程。
+无需改动 Synergy / NoMachine 的设置即可共存;如果不需要它们的剪贴板
+共享,关掉后干扰更少。
 
 ---
 
 ## English
 
-File sync.
+Fix: file sync no longer breaks when Synergy / NoMachine style
+keyboard-and-mouse sharing tools are running.
 
-- **Copy a file, paste it elsewhere**: copy files on one machine
-  (⌘C / Ctrl+C) and paste real files on another (⌘V / Ctrl+V);
-  multiple files per copy are supported
-- Up to 64MB total per transfer; folders are not supported yet (a log
-  message notes the skip) — zip them first
-- File sizes are pre-checked before reading, so oversized files are
-  never loaded into memory; received files are written to disk on the
-  network thread without blocking the UI
-- Incoming files land in a fresh temp subdirectory per batch (duplicate
-  names get a numeric suffix); filenames are sanitized against path
-  traversal
-- Test suite grown to 23 cases, covering file packing, unpacking,
-  saving, and oversize rejection
+- Their built-in clipboard sync does not support files: on screen
+  switch they downgrade "copied files" to plain path text, overwriting
+  the files this app just placed on the other machine's clipboard, so
+  pasting did nothing
+- Both ends now remember the most recent batch of synced files; when
+  the clipboard gets clobbered with matching path text, it is detected
+  and the files are restored to the clipboard immediately (with a log
+  message), and the path text is not mistakenly broadcast as copied text
+- Detection rule: plain text only, every line must map to a file in the
+  batch (full path / file:// URL / file name), within 10 minutes of the
+  last file sync; normal text copies are unaffected
+- Test suite grown to 25 cases
 
-Note: file sync uses a new message kind that 2.1.0 and earlier silently
-ignore. While versions are mixed, files will not reach old peers (text
-and images are unaffected) — please upgrade all machines to 2.2.0.
-
-Upgrading from v2.1.x uses the fully automatic flow.
+No Synergy / NoMachine configuration changes are required; disabling
+their clipboard sharing still reduces interference if you don't need it.

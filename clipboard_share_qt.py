@@ -57,7 +57,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -230,6 +230,34 @@ def _save_incoming_files(files) -> list:
             f.write(content)
         paths.append(path)
     return paths
+
+
+# Synergy/NoMachine 等键鼠共享软件也带剪贴板同步, 但不支持文件: 切换
+# 屏幕时会把对端"复制的文件"降级成路径文本, 覆盖我们刚写好的文件剪贴
+# 板。识别这类覆盖并恢复, 让两者共存。距最近一次文件同步超过 TTL 后
+# 恢复失效, 避免用户之后真想复制同名路径文本时被误判
+FILE_SHADOW_TTL = 600.0
+
+
+def _is_file_echo(text: str, names, paths) -> bool:
+    """判断 text 是否是最近一批同步文件的"路径文本影子": 每个非空行都
+    能对应到批内文件 (完整路径 / file:// URL / 文件名)。names 是批内
+    文件名集合, paths 是批内完整路径集合。"""
+    lines = [ln.strip() for ln in text.replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return False
+    for ln in lines:
+        cand = ln
+        if cand.startswith("file://"):
+            cand = QUrl(cand).toLocalFile() or cand
+        if cand in paths:
+            continue
+        base = cand.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+        if base and base in names:
+            continue
+        return False
+    return True
 
 
 def _image_fingerprint(img) -> bytes:
@@ -1036,6 +1064,9 @@ class App:
 
         self.clipboard = self.app.clipboard()
         self._applying = False  # 正在把远端内容写入剪贴板, 抑制回环广播
+        # 最近一批同步文件 (文件名集合, 可恢复的本地路径, 时间), 用于
+        # 识别并恢复被 Synergy 等软件覆盖成路径文本的文件剪贴板
+        self._file_shadow = None
 
         self.bridge = Bridge()
         self.engine = SyncEngine(secret, self.bridge, manual_peers)
@@ -1211,6 +1242,7 @@ class App:
                         f"跳过 {skipped} 个文件夹/特殊文件 (仅支持普通文件)")
                 if regular:
                     self.engine.submit(KIND_FILES, regular)  # 读取在工作线程
+                    self._remember_files(regular)
                 # 复制文件时 hasText 往往只是路径字符串, 不再当文本发
                 return
         if mime.hasImage():
@@ -1219,8 +1251,34 @@ class App:
                 self.engine.submit(KIND_IMAGE, image)  # PNG 编码在工作线程
         elif mime.hasText():
             text = mime.text()
-            if text:
+            if text and not self._restore_clobbered_files(text):
                 self.engine.submit(KIND_TEXT, text)
+
+    def _remember_files(self, paths: list):
+        names = {os.path.basename(p) for p in paths}
+        self._file_shadow = (names, list(paths), time.time())
+
+    def _restore_clobbered_files(self, text: str) -> bool:
+        """Synergy/NoMachine 等软件在切换屏幕时会把文件剪贴板覆盖成
+        路径文本。识别这种覆盖: 不当作文本广播出去, 并把文件重新写回
+        剪贴板 (文件还在本地/临时目录, 只需恢复 URL)。"""
+        if self._file_shadow is None:
+            return False
+        names, restore, when = self._file_shadow
+        if time.time() - when > FILE_SHADOW_TTL:
+            return False
+        if not _is_file_echo(text, names, set(restore)):
+            return False
+        keep = [p for p in restore if os.path.isfile(p)]
+        if keep:
+            # 复用远端应用路径: 抑制回环广播, 并刷新影子的时间戳,
+            # 之后每次被覆盖都能继续恢复
+            self.apply_remote({"type": "files", "data": keep})
+            self.window.append_log(
+                "剪贴板中的文件被其他软件 (如 Synergy) 覆盖为路径文本, 已恢复")
+        else:
+            self.window.append_log("忽略其他软件覆盖产生的文件路径文本")
+        return True
 
     def apply_remote(self, msg: dict):
         self._applying = True
@@ -1231,6 +1289,7 @@ class App:
                 mime = QMimeData()  # 文件已在网络线程落盘, 这里只放 URL
                 mime.setUrls([QUrl.fromLocalFile(p) for p in msg["data"]])
                 self.clipboard.setMimeData(mime)
+                self._remember_files(msg["data"])
             else:
                 self.clipboard.setImage(msg["data"])  # 已在网络线程解码
         finally:
