@@ -28,6 +28,7 @@ import os
 import queue
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -50,9 +51,16 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+# PyInstaller 打包的 Python 找不到系统 CA 证书库, 用 certifi 捆绑的证书
+try:
+    import certifi
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    SSL_CONTEXT = ssl.create_default_context()
 
 DISCOVERY_PORT = 48765
 TRANSFER_PORT = 48766
@@ -395,7 +403,8 @@ class Updater(QObject):
         try:
             req = urllib.request.Request(
                 UPDATE_API, headers={"User-Agent": "stellar-clipboard"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=15,
+                                        context=SSL_CONTEXT) as resp:
                 info = json.load(resp)
             latest = info.get("tag_name", "").lstrip("vV")
             if not latest or _version_key(latest) <= _version_key(APP_VERSION):
@@ -423,7 +432,8 @@ class Updater(QObject):
             dest = os.path.join(tempfile.gettempdir(), url.rsplit("/", 1)[-1])
             req = urllib.request.Request(
                 url, headers={"User-Agent": "stellar-clipboard"})
-            with urllib.request.urlopen(req, timeout=60) as resp, \
+            with urllib.request.urlopen(req, timeout=60,
+                                        context=SSL_CONTEXT) as resp, \
                     open(dest, "wb") as f:
                 while True:
                     chunk = resp.read(256 * 1024)
