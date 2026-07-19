@@ -13,9 +13,11 @@
 原理:
   - QClipboard 事件驱动地监听本机剪贴板变化 (无需轮询)
   - UDP 广播 (端口 48765) 自动发现同网段的其他实例
-  - 剪贴板变化时通过 TCP (端口 48766) 推送给所有已知节点
+  - 剪贴板变化时通过 TCP (端口 48766) 长连接推送给所有已知节点,
+    >=4KB 的文本先 zlib 压缩
   - 所有消息用 ChaCha20-Poly1305 加密 (密钥由 --secret 经 scrypt 派生),
     并带时间戳 + nonce 防重放, 所有机器必须使用相同 --secret
+  - 记住的口令存系统钥匙串 (keyring), 无可用后端时回退明文文件
 
 依赖: pip install PySide6 cryptography keyring
 """
@@ -53,7 +55,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.1.0"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
