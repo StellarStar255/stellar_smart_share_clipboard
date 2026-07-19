@@ -1,40 +1,36 @@
-# Stellar Clipboard v2.0.4
+# Stellar Clipboard v2.0.5
 
 ## 中文
 
-节点发现可靠性大幅增强。
+新特性 + 发现增强。
 
-- **广播 + 单播保活**:部分路由器会抑制/丢弃 UDP 广播转发,导致节点
-  时隐时现甚至完全互相发现不了。现在除受限广播外,还会向本子网定向
-  广播地址、以及所有已知节点补发单播心跳——任一方向哪怕偶然通过一次,
-  双方即转入稳定的单播互相保活,不再抖动掉线
-- **新增 `--peer IP` 手动节点**(可多次,或环境变量 `SSSC_PEERS=ip1,ip2`):
-  用于广播完全不可达的网络——跨网段、VPN(如 Tailscale)。只需一侧
-  配置,双方即可互相发现;手动节点自动加入 TCP 连接白名单
-- 启动日志显示已配置的手动节点
+- **节点互相介绍 (gossip)**:心跳现在携带已知节点名单,节点会互相
+  转介。这样即使两台机器之间广播不可达(如两台设备只和第三台广播通),
+  它们也能通过共同的节点得知彼此并直接单播互连——修复"两台 Ubuntu
+  只看得到 Mac、看不到对方"的问题
+- **显示主机名**:在线节点列表显示"主机名 (IP)"而不再只有 IP
+- **自定义别名**:双击任一节点可设置便于记忆的别名(保存在本机)
+- **修改口令**:托盘菜单新增"修改口令",无需重启即可更换,更换后
+  自动与使用新口令的节点重新配对
 
-从 v2.0.3 升级本版本即可体验全自动升级流程(macOS 零操作原地替换,
-Ubuntu 系统授权弹窗,Windows 静默安装)。
+从 v2.0.4 升级即为全自动流程。
 
 ---
 
 ## English
 
-Much more reliable peer discovery.
+New features + smarter discovery.
 
-- **Broadcast + unicast keep-alive**: some routers suppress or drop
-  forwarded UDP broadcasts, making peers flap or never discover each
-  other. Announcements now also go to the subnet-directed broadcast
-  address and, crucially, as unicast to every known peer — once either
-  direction gets through even once, both sides switch to stable unicast
-  keep-alive and stop flapping
-- **New `--peer IP` manual peers** (repeatable, or env
-  `SSSC_PEERS=ip1,ip2`): for networks where broadcast can't reach at
-  all — different subnets, VPNs such as Tailscale. Configuring one side
-  is enough for mutual discovery; manual peers are also allowed through
-  the TCP connection allowlist
-- The startup log lists configured manual peers
+- **Peer gossip**: heartbeats now carry the list of known peers, so nodes
+  introduce each other. Even when two machines can't reach each other by
+  broadcast (e.g. both only broadcast-reach a third), they learn about
+  each other through a common peer and connect directly via unicast —
+  fixes "two Ubuntu boxes see the Mac but not each other"
+- **Hostnames**: the peer list shows "hostname (IP)" instead of just IP
+- **Custom aliases**: double-click any peer to set a memorable alias
+  (stored locally)
+- **Change passphrase**: a new "Change passphrase" tray item lets you
+  switch passphrases without restarting; the app re-pairs with peers on
+  the new passphrase automatically
 
-Upgrading from v2.0.3 exercises the new fully automatic update flow
-(zero-touch in-place replace on macOS, system auth dialog on Ubuntu,
-silent install on Windows).
+Upgrading from v2.0.4 uses the fully automatic flow.
