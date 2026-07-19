@@ -17,7 +17,7 @@
   - 所有消息用 ChaCha20-Poly1305 加密 (密钥由 --secret 经 scrypt 派生),
     并带时间戳 + nonce 防重放, 所有机器必须使用相同 --secret
 
-依赖: pip install PySide6 cryptography
+依赖: pip install PySide6 cryptography keyring
 """
 
 import argparse
@@ -38,6 +38,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import zlib
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -63,6 +64,13 @@ try:
 except ImportError:
     SSL_CONTEXT = ssl.create_default_context()
 
+# 口令优先存系统钥匙串 (macOS Keychain / Windows 凭据管理器 / Secret
+# Service); keyring 未安装或无可用后端 (如无桌面的 Linux) 时回退明文文件
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
 DISCOVERY_PORT = 48765
 TRANSFER_PORT = 48766
 ANNOUNCE_INTERVAL = 2.0
@@ -86,6 +94,12 @@ HEADER = struct.Struct("!d16s")
 
 KIND_TEXT = 0
 KIND_IMAGE = 1
+KIND_TEXT_Z = 2       # zlib 压缩的文本; 2.0.7 及更早版本不识别, 会静默忽略
+
+COMPRESS_MIN = 4096   # 文本达到此大小才压缩, 小文本保持与旧版本兼容
+# Qt PNG 编码的 quality: 越大压缩越低越快, >=90 完全不压缩 (体积爆炸)。
+# 实测 80 比默认快约 40% 且体积相当, 见 commit 说明
+PNG_QUALITY = 80
 
 
 def derive_key(secret: str) -> bytes:
@@ -145,6 +159,19 @@ def _sock_stale(sock: socket.socket) -> bool:
         return bool(readable)
     except (OSError, ValueError):
         return True
+
+
+def _safe_decompress(data: bytes):
+    """解压 KIND_TEXT_Z 负载; 解压后超过 MAX_PAYLOAD 或数据异常时返回
+    None (对端已认证, 主要防实现错误而非恶意压缩炸弹)。"""
+    try:
+        d = zlib.decompressobj()
+        plain = d.decompress(data, MAX_PAYLOAD + 1)
+        if len(plain) > MAX_PAYLOAD or not d.eof:
+            return None
+        return plain
+    except zlib.error:
+        return None
 
 
 def _image_fingerprint(img) -> bytes:
@@ -372,9 +399,15 @@ class SyncEngine:
                     if opened is None:
                         continue  # 单条消息异常不必断开整个连接
                     _, body = opened
-                    if len(body) < 1 or body[0] not in (KIND_TEXT, KIND_IMAGE):
+                    if len(body) < 1 or body[0] not in (
+                            KIND_TEXT, KIND_IMAGE, KIND_TEXT_Z):
                         continue
                     data = body[1:]
+                    if body[0] == KIND_TEXT_Z:
+                        data = _safe_decompress(data)
+                        if data is None:
+                            continue
+                    # 去重哈希对解压后的内容计算, 与发送端一致
                     h = hashlib.sha256(data).digest()
                     with self.lock:
                         if h == self.last_hash:
@@ -417,7 +450,7 @@ class SyncEngine:
                 else:
                     buf = QBuffer()
                     buf.open(QIODevice.WriteOnly)
-                    obj.save(buf, "PNG")
+                    obj.save(buf, "PNG", PNG_QUALITY)
                     data = bytes(buf.data())
                     if not data:
                         continue
@@ -439,6 +472,11 @@ class SyncEngine:
                 continue
             if not targets:
                 continue
+            # 压缩放在哈希去重之后: last_hash 两端都对未压缩内容计算
+            if kind == KIND_TEXT and len(data) >= COMPRESS_MIN:
+                packed = zlib.compress(data, 6)
+                if len(packed) < len(data):
+                    kind, data = KIND_TEXT_Z, packed
             blob = self._seal(HEADER.pack(time.time(), NODE)
                               + bytes([kind]) + data)
             packet = MAGIC + struct.pack("!I", len(blob)) + blob
@@ -719,7 +757,9 @@ class SecretDialog(QDialog):
         self.edit = QLineEdit()
         self.edit.setEchoMode(QLineEdit.Password)
         layout.addWidget(self.edit)
-        self.remember = QCheckBox("在本机记住口令 (明文保存, 仅当前用户可读)")
+        self.remember = QCheckBox(
+            "在本机记住口令 (保存到系统钥匙串)" if keyring is not None
+            else "在本机记住口令 (明文保存, 仅当前用户可读)")
         self.remember.setChecked(True)
         layout.addWidget(self.remember)
         buttons = QDialogButtonBox(
@@ -1085,10 +1125,7 @@ class App:
             except OSError:
                 pass
         else:  # 不记住: 清掉本机保存的旧口令
-            try:
-                os.remove(SECRET_FILE)
-            except OSError:
-                pass
+            forget_secret()
 
     def run(self) -> int:
         try:
@@ -1111,20 +1148,59 @@ class App:
 
 
 SECRET_FILE = os.path.expanduser("~/.stellar_clipboard_secret")
+KEYRING_SERVICE = "stellar-smart-share-clipboard"
+KEYRING_USER = "shared-secret"
 
 
 def load_saved_secret():
+    if keyring is not None:
+        try:
+            secret = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+            if secret:
+                return secret
+        except Exception:
+            pass
     try:
         with open(SECRET_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() or None
+            secret = f.read().strip() or None
     except OSError:
         return None
+    if secret and keyring is not None:
+        try:
+            save_secret(secret)  # 把旧版明文文件迁移进钥匙串并删除
+        except OSError:
+            pass
+    return secret
 
 
 def save_secret(secret: str):
+    if keyring is not None:
+        try:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USER, secret)
+        except Exception:
+            pass  # 钥匙串不可用, 回退明文文件
+        else:
+            try:
+                os.remove(SECRET_FILE)  # 清理旧版遗留的明文文件
+            except OSError:
+                pass
+            return
     fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(secret)
+
+
+def forget_secret():
+    """删除本机保存的口令 (钥匙串条目和旧明文文件都清)。"""
+    if keyring is not None:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+        except Exception:
+            pass
+    try:
+        os.remove(SECRET_FILE)
+    except OSError:
+        pass
 
 
 def resolve_secret(cli_secret):
