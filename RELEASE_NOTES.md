@@ -1,40 +1,40 @@
-# Stellar Clipboard v2.0.3
+# Stellar Clipboard v2.0.4
 
 ## 中文
 
-升级体验大幅改进(从本版本升级到以后的版本时生效)。
+节点发现可靠性大幅增强。
 
-- **下载进度条**:应用内更新显示真实下载进度(MB),可随时取消
-- **macOS 全自动升级**:不再需要手动拖拽——下载完成后应用自动退出,
-  后台自动挂载 dmg、原子替换 `/Applications` 中的应用并重启新版本;
-  且应用内更新不再触发 Gatekeeper 的"无法验证开发者"提示
-- **Ubuntu 自动安装**:不再依赖软件中心——弹出系统授权窗口,
-  输入密码后自动 `dpkg -i` 安装并重启程序
-- **Windows 静默升级**:安装器以 /SILENT 运行,装完自动重启程序
+- **广播 + 单播保活**:部分路由器会抑制/丢弃 UDP 广播转发,导致节点
+  时隐时现甚至完全互相发现不了。现在除受限广播外,还会向本子网定向
+  广播地址、以及所有已知节点补发单播心跳——任一方向哪怕偶然通过一次,
+  双方即转入稳定的单播互相保活,不再抖动掉线
+- **新增 `--peer IP` 手动节点**(可多次,或环境变量 `SSSC_PEERS=ip1,ip2`):
+  用于广播完全不可达的网络——跨网段、VPN(如 Tailscale)。只需一侧
+  配置,双方即可互相发现;手动节点自动加入 TCP 连接白名单
+- 启动日志显示已配置的手动节点
 
-> 提示:本次从 v2.0.2 升级到 v2.0.3 仍走旧流程(macOS 需手动拖拽一次),
-> 上述全自动体验从 v2.0.3 升级到后续版本时开始生效。
+从 v2.0.3 升级本版本即可体验全自动升级流程(macOS 零操作原地替换,
+Ubuntu 系统授权弹窗,Windows 静默安装)。
 
 ---
 
 ## English
 
-Major upgrade-experience improvements (effective when upgrading FROM this
-version to future releases).
+Much more reliable peer discovery.
 
-- **Download progress**: in-app updates now show real download progress
-  (MB) with a cancel button
-- **Fully automatic upgrades on macOS**: no more manual dragging — after
-  download the app quits, a background helper mounts the dmg, atomically
-  replaces the app in `/Applications` and relaunches the new version;
-  in-app updates also no longer trigger Gatekeeper's unidentified
-  developer prompt
-- **Automatic install on Ubuntu**: no more Software Center dependency —
-  a system authentication dialog appears, then the package is installed
-  via `dpkg -i` and the app restarts
-- **Silent upgrade on Windows**: the installer runs with /SILENT and
-  relaunches the app when done
+- **Broadcast + unicast keep-alive**: some routers suppress or drop
+  forwarded UDP broadcasts, making peers flap or never discover each
+  other. Announcements now also go to the subnet-directed broadcast
+  address and, crucially, as unicast to every known peer — once either
+  direction gets through even once, both sides switch to stable unicast
+  keep-alive and stop flapping
+- **New `--peer IP` manual peers** (repeatable, or env
+  `SSSC_PEERS=ip1,ip2`): for networks where broadcast can't reach at
+  all — different subnets, VPNs such as Tailscale. Configuring one side
+  is enough for mutual discovery; manual peers are also allowed through
+  the TCP connection allowlist
+- The startup log lists configured manual peers
 
-> Note: upgrading from v2.0.2 to v2.0.3 still uses the old flow (one
-> manual drag on macOS); the fully automatic experience kicks in when
-> upgrading from v2.0.3 onward.
+Upgrading from v2.0.3 exercises the new fully automatic update flow
+(zero-touch in-place replace on macOS, system auth dialog on Ubuntu,
+silent install on Windows).

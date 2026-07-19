@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -89,6 +89,18 @@ def derive_key(secret: str) -> bytes:
                           n=2 ** 14, r=8, p=1, dklen=32)
 
 
+def _local_broadcast_addrs():
+    """猜测本机所在子网的定向广播地址 (按 /24), 作为受限广播的补充。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # 不发包, 只查路由拿本机出口 IP
+        ip = s.getsockname()[0]
+        s.close()
+        return {ip.rsplit(".", 1)[0] + ".255"}
+    except OSError:
+        return set()
+
+
 def recv_exact(conn: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -107,8 +119,9 @@ class Bridge(QObject):
 
 
 class SyncEngine:
-    def __init__(self, secret: str, bridge: Bridge):
+    def __init__(self, secret: str, bridge: Bridge, manual_peers=()):
         self.bridge = bridge
+        self.manual_peers = {ip.strip() for ip in manual_peers if ip.strip()}
         self.cipher = ChaCha20Poly1305(derive_key(secret))
         self.lock = threading.Lock()
         self.peers = {}          # node_id -> (ip, last_seen)
@@ -179,16 +192,26 @@ class SyncEngine:
 
     # ---- 发现 ----
 
+    def _announce_targets(self):
+        """广播地址 + 手动节点 + 已知节点 (单播)。
+        部分路由器会抑制/丢弃广播转发, 广播也不能穿越 VPN 和网段;
+        对已知/手动节点补发单播, 任一方向通过一次后双方即可稳定互相保活。"""
+        with self.lock:
+            known = {ip for ip, _ in self.peers.values()}
+        return ({"255.255.255.255"} | _local_broadcast_addrs()
+                | self.manual_peers | known)
+
     def _announce_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         while True:
             # 每次重新加密: 时间戳和 nonce 都必须是新的
             packet = MAGIC + self._seal(HEADER.pack(time.time(), NODE))
-            try:
-                sock.sendto(packet, ("255.255.255.255", DISCOVERY_PORT))
-            except OSError:
-                pass
+            for addr in self._announce_targets():
+                try:
+                    sock.sendto(packet, (addr, DISCOVERY_PORT))
+                except OSError:
+                    pass
             now = time.time()
             with self.lock:
                 dead = [nid for nid, (_, seen) in self.peers.items()
@@ -230,7 +253,9 @@ class SyncEngine:
         while True:
             conn, addr = srv.accept()
             with self.lock:
-                known = any(ip == addr[0] for ip, _ in self.peers.values())
+                known = (addr[0] in self.manual_peers
+                         or any(ip == addr[0]
+                                for ip, _ in self.peers.values()))
             # 只接受已通过发现认证的节点 IP, 并限制并发连接数;
             # 陌生 IP 无法让本机读入任何数据 (防未认证的内存 DoS)
             if not known or not self._conn_slots.acquire(blocking=False):
@@ -620,7 +645,7 @@ class MainWindow(QWidget):
 
 
 class App:
-    def __init__(self, secret):
+    def __init__(self, secret, manual_peers=()):
         self.app = QApplication(sys.argv)
         icon = make_app_icon()
         self.app.setWindowIcon(icon)  # 主窗口随 QApplication 继承此图标
@@ -641,7 +666,7 @@ class App:
         self._applying = False  # 正在把远端内容写入剪贴板, 抑制回环广播
 
         self.bridge = Bridge()
-        self.engine = SyncEngine(secret, self.bridge)
+        self.engine = SyncEngine(secret, self.bridge, manual_peers)
         self.window = MainWindow(self.engine, secret)
 
         self.bridge.remote_clip.connect(self.apply_remote, Qt.QueuedConnection)
@@ -837,6 +862,9 @@ class App:
         self.window.show()
         self.window.append_log(f"已启动 v{APP_VERSION}, 本机节点 {NODE_ID[:8]}, "
                                f"图形后端 {self.app.platformName()}")
+        if self.engine.manual_peers:
+            self.window.append_log(
+                "手动节点: " + ", ".join(sorted(self.engine.manual_peers)))
         if self.app.platformName() == "wayland":
             self.window.append_log(
                 "警告: 正运行在 Wayland 后端, 本机复制的内容可能无法同步出去; "
@@ -890,10 +918,15 @@ def main():
                         help="共享口令, 所有机器必须一致, 请使用足够复杂的口令。"
                              "为避免泄露到 shell 历史和进程列表, 推荐改用"
                              "环境变量 SSSC_SECRET 或留空后交互输入")
+    parser.add_argument("--peer", action="append", default=[], metavar="IP",
+                        help="手动指定对端 IP (可多次)。用于广播不可达的网络: "
+                             "路由器过滤广播、跨网段、VPN (如 Tailscale)。"
+                             "也可用环境变量 SSSC_PEERS=ip1,ip2")
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {APP_VERSION}")
     args = parser.parse_args()
-    sys.exit(App(resolve_secret(args.secret)).run())
+    peers = args.peer + os.environ.get("SSSC_PEERS", "").split(",")
+    sys.exit(App(resolve_secret(args.secret), peers).run())
 
 
 if __name__ == "__main__":
