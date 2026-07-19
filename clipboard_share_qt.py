@@ -25,6 +25,7 @@ import getpass
 import hashlib
 import os
 import queue
+import signal
 import socket
 import struct
 import sys
@@ -454,6 +455,27 @@ class App:
         self.tray.show()
 
         self.clipboard.dataChanged.connect(self.on_local_change)
+        self._install_sigint_handler()
+
+    def _install_sigint_handler(self):
+        """终端里连按两次 Ctrl+C (2 秒内) 退出程序。"""
+        self._sigint_at = 0.0
+
+        def handler(signum, frame):
+            now = time.monotonic()
+            if now - self._sigint_at <= 2.0:
+                print("\n退出", flush=True)
+                self.app.quit()
+            else:
+                self._sigint_at = now
+                print("\n再按一次 Ctrl+C 退出 (2 秒内)", flush=True)
+
+        signal.signal(signal.SIGINT, handler)
+        # Qt 事件循环阻塞在 C++ 侧时 Python 信号处理器不会被执行,
+        # 用一个空转定时器周期性回到解释器, 让信号得以处理
+        self._sigint_timer = QTimer()
+        self._sigint_timer.timeout.connect(lambda: None)
+        self._sigint_timer.start(200)
 
     def show_window(self):
         self.window.show()
