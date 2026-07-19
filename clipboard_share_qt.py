@@ -706,7 +706,12 @@ class App:
             QMessageBox.critical(None, "无法启动", str(e))
             return 1
         self.window.show()
-        self.window.append_log(f"已启动 v{APP_VERSION}, 本机节点 {NODE_ID[:8]}")
+        self.window.append_log(f"已启动 v{APP_VERSION}, 本机节点 {NODE_ID[:8]}, "
+                               f"图形后端 {self.app.platformName()}")
+        if self.app.platformName() == "wayland":
+            self.window.append_log(
+                "警告: 正运行在 Wayland 后端, 本机复制的内容可能无法同步出去; "
+                "请安装 xcb 相关库或用 QT_QPA_PLATFORM=xcb 启动")
         self.window.append_log("等待发现同网段节点…")
         return self.app.exec()
 
@@ -738,7 +743,19 @@ def resolve_secret(cli_secret):
     return secret
 
 
+def _fix_linux_clipboard_backend():
+    """Wayland 不允许后台应用监听剪贴板变化 (Ubuntu 22.04+ 默认 Wayland),
+    表现为本机复制的内容不会同步出去 (接收正常)。强制优先用 XWayland
+    (xcb 后端), 其剪贴板由合成器桥接, 后台监听可用; xcb 加载失败时
+    回退 wayland, 保证程序至少能启动。"""
+    if (sys.platform.startswith("linux")
+            and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            and "QT_QPA_PLATFORM" not in os.environ):
+        os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
+
+
 def main():
+    _fix_linux_clipboard_backend()
     parser = argparse.ArgumentParser(description="局域网剪贴板同步 (Qt 版)")
     parser.add_argument("--secret",
                         help="共享口令, 所有机器必须一致, 请使用足够复杂的口令。"
