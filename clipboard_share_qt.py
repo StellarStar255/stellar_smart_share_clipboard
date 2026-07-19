@@ -2,7 +2,8 @@
 """Stellar Smart Share Clipboard (Qt 版)
 
 在同一局域网内的多台电脑 (macOS / Windows / Linux) 之间同步剪贴板,
-支持 文本 + 图片, 带主窗口界面和系统托盘图标。
+支持 文本 + 图片 + 文件 (复制文件后在另一台电脑直接粘贴),
+带主窗口界面和系统托盘图标。
 
 用法: 在每台电脑上运行
     python clipboard_share_qt.py --secret 口令
@@ -47,7 +48,8 @@ try:
 except ImportError:
     sys.exit("缺少依赖 cryptography, 请先执行: pip install cryptography")
 
-from PySide6.QtCore import (QBuffer, QIODevice, QObject, Qt, QTimer, Signal)
+from PySide6.QtCore import (QBuffer, QIODevice, QMimeData, QObject, Qt,
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QDialogButtonBox, QHBoxLayout, QLabel,
@@ -55,7 +57,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -77,7 +79,7 @@ DISCOVERY_PORT = 48765
 TRANSFER_PORT = 48766
 ANNOUNCE_INTERVAL = 2.0
 PEER_TIMEOUT = 10.0
-MAX_PAYLOAD = 64 * 1024 * 1024  # 图片可能较大, 上限 64MB
+MAX_PAYLOAD = 64 * 1024 * 1024  # 图片/文件可能较大, 上限 64MB
 MAGIC = b"SSC2"                 # 协议 v2 (加密), 与旧版明文协议不兼容
 KDF_SALT = b"stellar-smart-share-clipboard-v2"
 NONCE_LEN = 12
@@ -97,6 +99,7 @@ HEADER = struct.Struct("!d16s")
 KIND_TEXT = 0
 KIND_IMAGE = 1
 KIND_TEXT_Z = 2       # zlib 压缩的文本; 2.0.7 及更早版本不识别, 会静默忽略
+KIND_FILES = 3        # 文件列表; 2.1.0 及更早版本不识别, 会静默忽略
 
 COMPRESS_MIN = 4096   # 文本达到此大小才压缩, 小文本保持与旧版本兼容
 # Qt PNG 编码的 quality: 越大压缩越低越快, >=90 完全不压缩 (体积爆炸)。
@@ -176,6 +179,59 @@ def _safe_decompress(data: bytes):
         return None
 
 
+# 收到的文件先落盘到临时目录再放进剪贴板, 粘贴动作本身就是复制,
+# 之后残留的副本交由系统的临时目录清理机制处理
+FILES_DIR = os.path.join(tempfile.gettempdir(), "StellarClipboard")
+
+
+def _sanitize_filename(name: str) -> str:
+    """只保留文件名部分, 防止对端 (即使已认证) 构造路径穿越。"""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return name if name not in ("", ".", "..") else "unnamed"
+
+
+def _unpack_files(data: bytes):
+    """解析 KIND_FILES 负载: (!H 名字长度 + 名字 + !I 内容长度 + 内容)*。
+    格式异常返回 None; 返回 [(名字, 内容), ...]。"""
+    files, off = [], 0
+    try:
+        while off < len(data):
+            (nlen,) = struct.unpack_from("!H", data, off)
+            off += 2
+            name = data[off:off + nlen].decode("utf-8")
+            off += nlen
+            (flen,) = struct.unpack_from("!I", data, off)
+            off += 4
+            if off + flen > len(data):
+                return None
+            files.append((name, bytes(data[off:off + flen])))
+            off += flen
+    except (struct.error, UnicodeDecodeError):
+        return None
+    return files or None
+
+
+def _save_incoming_files(files) -> list:
+    """把收到的文件写进独立子目录 (避免与上一批同名文件互相覆盖),
+    返回落盘路径列表。"""
+    dest = os.path.join(FILES_DIR, uuid.uuid4().hex[:12])
+    os.makedirs(dest, exist_ok=True)
+    paths, used = [], set()
+    for name, content in files:
+        name = _sanitize_filename(name)
+        base, ext = os.path.splitext(name)
+        final, n = name, 1
+        while final.lower() in used:  # 同一批内重名, 加序号区分
+            final = f"{base}-{n}{ext}"
+            n += 1
+        used.add(final.lower())
+        path = os.path.join(dest, final)
+        with open(path, "wb") as f:
+            f.write(content)
+        paths.append(path)
+    return paths
+
+
 def _image_fingerprint(img) -> bytes:
     """QImage 原始像素的哈希, 比 PNG 编码快得多, 用于在编码前识别
     重复触发的同一张图 (macOS 一次复制常触发多次 dataChanged)。"""
@@ -189,7 +245,8 @@ def _image_fingerprint(img) -> bytes:
 
 class Bridge(QObject):
     """把网络线程的事件转交给 GUI 主线程 (剪贴板和界面只能在主线程操作)。"""
-    # {"type": "text", "data": bytes} 或 {"type": "image", "data": QImage}
+    # {"type": "text", "data": bytes} / {"type": "image", "data": QImage}
+    # / {"type": "files", "data": 已落盘的本地路径列表}
     remote_clip = Signal(dict)
     peers_changed = Signal(list)    # 在线节点 IP 列表
     status = Signal(str)            # 日志消息
@@ -412,7 +469,7 @@ class SyncEngine:
                     bad = 0
                     _, body = opened
                     if len(body) < 1 or body[0] not in (
-                            KIND_TEXT, KIND_IMAGE, KIND_TEXT_Z):
+                            KIND_TEXT, KIND_IMAGE, KIND_TEXT_Z, KIND_FILES):
                         continue
                     data = body[1:]
                     if body[0] == KIND_TEXT_Z:
@@ -433,6 +490,24 @@ class SyncEngine:
                         self.bridge.remote_clip.emit(
                             {"type": "image", "data": image})
                         self.bridge.status.emit(f"收到图片 来自 {addr[0]}")
+                    elif body[0] == KIND_FILES:
+                        files = _unpack_files(data)
+                        if files is None:
+                            continue
+                        try:
+                            # 在网络线程落盘, 大文件不卡界面线程
+                            paths = _save_incoming_files(files)
+                        except OSError as e:
+                            self.bridge.status.emit(f"保存收到的文件失败: {e}")
+                            continue
+                        self.bridge.remote_clip.emit(
+                            {"type": "files", "data": paths})
+                        names = ", ".join(
+                            os.path.basename(p) for p in paths[:3])
+                        if len(paths) > 3:
+                            names += f" 等 {len(paths)} 个"
+                        self.bridge.status.emit(
+                            f"收到文件 {names} 来自 {addr[0]}")
                     else:
                         self.bridge.remote_clip.emit(
                             {"type": "text", "data": data})
@@ -445,9 +520,38 @@ class SyncEngine:
     # ---- 发送 ----
 
     def submit(self, kind: int, obj):
-        """kind: KIND_TEXT (obj 为 str) / KIND_IMAGE (obj 为 QImage)。
-        在主线程调用; 编码/加密/发送都在工作线程完成, 不阻塞界面。"""
+        """kind: KIND_TEXT (obj 为 str) / KIND_IMAGE (obj 为 QImage) /
+        KIND_FILES (obj 为路径列表)。
+        在主线程调用; 读文件/编码/加密/发送都在工作线程完成, 不阻塞界面。"""
         self._out_q.put((kind, obj))
+
+    def _pack_files(self, paths):
+        """读取并打包文件列表为 KIND_FILES 负载, 失败或超限时返回 None。
+        先按文件大小预检, 避免把远超上限的大文件整个读进内存。"""
+        try:
+            total = sum(os.path.getsize(p) for p in paths)
+        except OSError as e:
+            self.bridge.status.emit(f"读取文件失败: {e}")
+            return None
+        if total > MAX_PAYLOAD:
+            self.bridge.status.emit(
+                f"文件过大 ({total >> 20} MB), 超过 "
+                f"{MAX_PAYLOAD >> 20} MB 上限, 不同步")
+            return None
+        parts = []
+        for p in paths:
+            name = os.path.basename(p).encode("utf-8")
+            if len(name) > 0xFFFF:
+                continue
+            try:
+                with open(p, "rb") as f:
+                    content = f.read()
+            except OSError as e:
+                self.bridge.status.emit(f"读取文件失败: {e}")
+                return None
+            parts.append(struct.pack("!H", len(name)) + name
+                         + struct.pack("!I", len(content)) + content)
+        return b"".join(parts) or None
 
     def _dispatch_loop(self):
         """单线程串行处理本地剪贴板内容, 保证先复制的先送达。"""
@@ -467,6 +571,10 @@ class SyncEngine:
                     if not data:
                         continue
                     self._img_cache = (fp, data)
+            elif kind == KIND_FILES:
+                data = self._pack_files(obj)
+                if data is None:
+                    continue
             else:
                 data = obj.encode("utf-8")
             h = hashlib.sha256(data).digest()
@@ -492,7 +600,7 @@ class SyncEngine:
             blob = self._seal(HEADER.pack(time.time(), NODE)
                               + bytes([kind]) + data)
             packet = MAGIC + struct.pack("!I", len(blob)) + blob
-            name = "图片" if kind == KIND_IMAGE else "文本"
+            name = {KIND_IMAGE: "图片", KIND_FILES: "文件"}.get(kind, "文本")
             self.bridge.status.emit(f"推送{name} 到 {len(targets)} 个节点")
             for ip in targets:
                 self._enqueue_send(ip, packet)
@@ -1093,6 +1201,18 @@ class App:
         mime = self.clipboard.mimeData()
         if mime is None:
             return
+        if mime.hasUrls():
+            local = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+            if local:
+                regular = [p for p in local if os.path.isfile(p)]
+                skipped = len(local) - len(regular)
+                if skipped:
+                    self.window.append_log(
+                        f"跳过 {skipped} 个文件夹/特殊文件 (仅支持普通文件)")
+                if regular:
+                    self.engine.submit(KIND_FILES, regular)  # 读取在工作线程
+                # 复制文件时 hasText 往往只是路径字符串, 不再当文本发
+                return
         if mime.hasImage():
             image = self.clipboard.image()
             if not image.isNull():
@@ -1107,6 +1227,10 @@ class App:
         try:
             if msg["type"] == "text":
                 self.clipboard.setText(msg["data"].decode("utf-8", "replace"))
+            elif msg["type"] == "files":
+                mime = QMimeData()  # 文件已在网络线程落盘, 这里只放 URL
+                mime.setUrls([QUrl.fromLocalFile(p) for p in msg["data"]])
+                self.clipboard.setMimeData(mime)
             else:
                 self.clipboard.setImage(msg["data"])  # 已在网络线程解码
         finally:

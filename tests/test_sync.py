@@ -71,6 +71,11 @@ def wait_for(cond, timeout=3.0):
     return cond()
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def solid_image(color, size=16):
     img = QImage(size, size, QImage.Format_ARGB32)
     img.fill(QColor(color))
@@ -108,6 +113,37 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(m.recv_exact(b, 4), b"TAIL")
         a.close()
         b.close()
+
+    def test_sanitize_filename(self):
+        self.assertEqual(m._sanitize_filename("a.txt"), "a.txt")
+        self.assertEqual(m._sanitize_filename("../../etc/passwd"), "passwd")
+        self.assertEqual(m._sanitize_filename("..\\..\\x.exe"), "x.exe")
+        self.assertEqual(m._sanitize_filename(".."), "unnamed")
+        self.assertEqual(m._sanitize_filename(""), "unnamed")
+
+    def test_unpack_files_roundtrip_and_garbage(self):
+        payload = b"".join(
+            struct.pack("!H", len(n)) + n + struct.pack("!I", len(c)) + c
+            for n, c in [("甲.txt".encode(), b"AAA"), (b"b.bin", b"")])
+        self.assertEqual(m._unpack_files(payload),
+                         [("甲.txt", b"AAA"), ("b.bin", b"")])
+        self.assertIsNone(m._unpack_files(payload[:-1]))   # 截断
+        self.assertIsNone(m._unpack_files(b""))            # 空
+        self.assertIsNone(m._unpack_files(b"\xff\xff junk"))
+
+    def test_save_incoming_files_dedup_names(self):
+        old = m.FILES_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            m.FILES_DIR = tmp
+            try:
+                paths = m._save_incoming_files(
+                    [("a.txt", b"1"), ("a.txt", b"2"), ("../a.txt", b"3")])
+            finally:
+                m.FILES_DIR = old
+            self.assertEqual([os.path.basename(p) for p in paths],
+                             ["a.txt", "a-1.txt", "a-2.txt"])
+            self.assertEqual([read_bytes(p) for p in paths],
+                             [b"1", b"2", b"3"])
 
     def test_safe_decompress(self):
         self.assertEqual(m._safe_decompress(zlib.compress(b"abc")), b"abc")
@@ -158,6 +194,29 @@ class TestReceiver(unittest.TestCase):
         self.assertEqual(msg["type"], "image")
         self.assertIsInstance(msg["data"], QImage)  # 网络线程已解码
         self.assertFalse(msg["data"].isNull())
+
+    def test_files_saved_to_disk_and_emitted(self):
+        old = m.FILES_DIR
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(setattr, m, "FILES_DIR", old)
+        m.FILES_DIR = self._tmp.name
+        payload = b"".join(
+            struct.pack("!H", len(n)) + n + struct.pack("!I", len(c)) + c
+            for n, c in [(b"doc.pdf", b"PDF-DATA"), (b"note.txt", b"hi")])
+        self.send(m.KIND_FILES, payload)
+        self.assertTrue(wait_for(lambda: len(self.got()) == 1))
+        msg = self.got()[0][0]
+        self.assertEqual(msg["type"], "files")
+        self.assertEqual([os.path.basename(p) for p in msg["data"]],
+                         ["doc.pdf", "note.txt"])
+        self.assertEqual(read_bytes(msg["data"][0]), b"PDF-DATA")
+
+    def test_malformed_files_payload_dropped(self):
+        self.send(m.KIND_FILES, b"\xff\xff not a valid pack")
+        self.send(m.KIND_TEXT, b"still-alive")
+        self.assertTrue(wait_for(lambda: len(self.got()) == 1))
+        self.assertEqual(self.got()[0][0]["data"], b"still-alive")
 
     def test_compressed_text_roundtrip(self):
         text = ("你好 " * 2000).encode()
@@ -268,6 +327,31 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual(zlib.decompress(self.wire[0][1:]), big.encode())
         self.assertEqual(self.wire[1][0], m.KIND_TEXT)
         self.assertEqual(self.wire[1][1:], b"hello")
+
+    def test_files_packed_and_oversize_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = os.path.join(tmp, "a.txt")
+            p2 = os.path.join(tmp, "b.bin")
+            with open(p1, "w") as f:
+                f.write("hello")
+            with open(p2, "wb") as f:
+                f.write(b"\x00\x01\x02")
+            self.sender.submit(m.KIND_FILES, [p1, p2])
+            self.assertTrue(wait_for(lambda: len(self.wire) == 1))
+            self.assertEqual(self.wire[0][0], m.KIND_FILES)
+            self.assertEqual(m._unpack_files(self.wire[0][1:]),
+                             [("a.txt", b"hello"), ("b.bin", b"\x00\x01\x02")])
+            # 大小预检: 超限文件不读入内存、不发送, 只提示
+            old_max = m.MAX_PAYLOAD
+            m.MAX_PAYLOAD = 4
+            try:
+                self.sender.submit(m.KIND_FILES, [p1])
+                self.assertTrue(wait_for(lambda: any(
+                    "文件过大" in a[0]
+                    for a in self.sender.bridge.status.msgs)))
+            finally:
+                m.MAX_PAYLOAD = old_max
+            self.assertEqual(len(self.wire), 1)
 
     def test_image_encode_cache_and_dedup(self):
         img = solid_image("teal", 64)
