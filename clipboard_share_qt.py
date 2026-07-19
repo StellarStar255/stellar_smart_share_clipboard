@@ -5,22 +5,20 @@
 支持 文本 + 图片, 带主窗口界面和系统托盘图标。
 
 用法: 在每台电脑上运行
-    python clipboard_share_qt.py [--secret 口令]
+    python clipboard_share_qt.py --secret 口令
 
 原理:
   - QClipboard 事件驱动地监听本机剪贴板变化 (无需轮询)
   - UDP 广播 (端口 48765) 自动发现同网段的其他实例
   - 剪贴板变化时通过 TCP (端口 48766) 推送给所有已知节点
-  - 消息带 HMAC 校验, 所有机器必须使用相同 --secret
+  - 所有消息用 ChaCha20-Poly1305 加密 (密钥由 --secret 经 scrypt 派生),
+    并带时间戳 + nonce 防重放, 所有机器必须使用相同 --secret
 
-依赖: pip install PySide6
+依赖: pip install PySide6 cryptography
 """
 
 import argparse
-import base64
 import hashlib
-import hmac
-import json
 import os
 import socket
 import struct
@@ -29,7 +27,12 @@ import threading
 import time
 import uuid
 
-from PySide6.QtCore import QBuffer, QIODevice, QObject, Qt, Signal
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+except ImportError:
+    sys.exit("缺少依赖 cryptography, 请先执行: pip install cryptography")
+
+from PySide6.QtCore import (QBuffer, QIODevice, QObject, Qt, QTimer, Signal)
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel,
                                QListWidget, QMenu, QPlainTextEdit,
@@ -40,28 +43,34 @@ TRANSFER_PORT = 48766
 ANNOUNCE_INTERVAL = 2.0
 PEER_TIMEOUT = 10.0
 MAX_PAYLOAD = 64 * 1024 * 1024  # 图片可能较大, 上限 64MB
-MAGIC = b"SSSC"
+MAGIC = b"SSC2"                 # 协议 v2 (加密), 与旧版明文协议不兼容
+KDF_SALT = b"stellar-smart-share-clipboard-v2"
+NONCE_LEN = 12
+TIME_WINDOW = 30.0              # 消息时间戳容忍偏差 (秒), 防重放
 
-NODE_ID = uuid.uuid4().hex
+NODE = uuid.uuid4().bytes       # 本机节点标识 (16 字节)
+NODE_ID = NODE.hex()
+
+# 每条消息明文的公共头: 时间戳 (double) + 节点标识 (16 字节)
+HEADER = struct.Struct("!d16s")
+
+KIND_TEXT = 0
+KIND_IMAGE = 1
 
 
-def sign(secret: str, data: bytes) -> str:
-    return hmac.new(secret.encode("utf-8"), data, hashlib.sha256).hexdigest()
-
-
-def build_packet(secret: str, payload: bytes) -> bytes:
-    return (MAGIC + sign(secret, payload).encode("ascii")
-            + struct.pack("!I", len(payload)) + payload)
+def derive_key(secret: str) -> bytes:
+    return hashlib.scrypt(secret.encode("utf-8"), salt=KDF_SALT,
+                          n=2 ** 14, r=8, p=1, dklen=32)
 
 
 def recv_exact(conn: socket.socket, n: int) -> bytes:
-    buf = b""
+    buf = bytearray()
     while len(buf) < n:
         chunk = conn.recv(min(65536, n - len(buf)))
         if not chunk:
             raise ConnectionError("连接中断")
         buf += chunk
-    return buf
+    return bytes(buf)
 
 
 class Bridge(QObject):
@@ -73,12 +82,49 @@ class Bridge(QObject):
 
 class SyncEngine:
     def __init__(self, secret: str, bridge: Bridge):
-        self.secret = secret
         self.bridge = bridge
+        self.cipher = ChaCha20Poly1305(derive_key(secret))
         self.lock = threading.Lock()
         self.peers = {}          # node_id -> (ip, last_seen)
         self.last_hash = None    # 最近同步内容的哈希, 防回环
         self.paused = False
+        self._nonces = {}        # nonce -> seen_at, 防重放
+        self._skew_warned = 0.0  # 上次时钟偏差告警时间, 避免刷屏
+
+    # ---- 加密 ----
+
+    def _seal(self, plaintext: bytes) -> bytes:
+        nonce = os.urandom(NONCE_LEN)
+        return nonce + self.cipher.encrypt(nonce, plaintext, MAGIC)
+
+    def _open_checked(self, blob: bytes):
+        """解密 + 时间戳/nonce 防重放校验。返回 (node, body) 或 None。"""
+        if len(blob) < NONCE_LEN + 16 + HEADER.size:
+            return None
+        nonce = bytes(blob[:NONCE_LEN])
+        try:
+            plain = self.cipher.decrypt(nonce, bytes(blob[NONCE_LEN:]), MAGIC)
+        except Exception:
+            return None  # 口令不同或数据被篡改
+        ts, node = HEADER.unpack_from(plain)
+        if node == NODE:
+            return None
+        now = time.time()
+        if abs(now - ts) > TIME_WINDOW:
+            if now - self._skew_warned > 60:
+                self._skew_warned = now
+                self.bridge.status.emit(
+                    "忽略了时间戳偏差过大的消息, 请检查各机器的系统时间是否同步")
+            return None
+        with self.lock:
+            if nonce in self._nonces:
+                return None  # 重放
+            self._nonces[nonce] = now
+            expired = [n for n, seen in self._nonces.items()
+                       if now - seen > TIME_WINDOW * 2]
+            for n in expired:
+                del self._nonces[n]
+        return node, plain[HEADER.size:]
 
     def start(self):
         """先在主线程绑定端口, 失败时抛出带清晰提示的异常。"""
@@ -107,9 +153,9 @@ class SyncEngine:
     def _announce_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        payload = json.dumps({"id": NODE_ID}).encode("utf-8")
-        packet = MAGIC + sign(self.secret, payload).encode("ascii") + payload
         while True:
+            # 每次重新加密: 时间戳和 nonce 都必须是新的
+            packet = MAGIC + self._seal(HEADER.pack(time.time(), NODE))
             try:
                 sock.sendto(packet, ("255.255.255.255", DISCOVERY_PORT))
             except OSError:
@@ -132,23 +178,17 @@ class SyncEngine:
             try:
                 data, addr = sock.recvfrom(4096)
             except OSError:
+                time.sleep(0.5)  # 避免 socket 异常时空转
                 continue
-            if not data.startswith(MAGIC) or len(data) < len(MAGIC) + 64:
+            if not data.startswith(MAGIC):
                 continue
-            sig = data[len(MAGIC):len(MAGIC) + 64].decode("ascii", "ignore")
-            payload = data[len(MAGIC) + 64:]
-            if not hmac.compare_digest(sig, sign(self.secret, payload)):
+            opened = self._open_checked(data[len(MAGIC):])
+            if opened is None:
                 continue
-            try:
-                info = json.loads(payload)
-            except ValueError:
-                continue
-            nid = info.get("id")
-            if not nid or nid == NODE_ID:
-                continue
+            node, _ = opened
             with self.lock:
-                is_new = nid not in self.peers
-                self.peers[nid] = (addr[0], time.time())
+                is_new = node not in self.peers
+                self.peers[node] = (addr[0], time.time())
                 ips = [ip for ip, _ in self.peers.values()]
             if is_new:
                 self.bridge.status.emit(f"发现节点: {addr[0]}")
@@ -167,42 +207,43 @@ class SyncEngine:
         try:
             with conn:
                 conn.settimeout(60)
-                header = recv_exact(conn, len(MAGIC) + 64 + 4)
+                header = recv_exact(conn, len(MAGIC) + 4)
                 if not header.startswith(MAGIC):
                     return
-                sig = header[len(MAGIC):len(MAGIC) + 64].decode("ascii", "ignore")
-                (length,) = struct.unpack("!I", header[len(MAGIC) + 64:])
-                if length > MAX_PAYLOAD:
+                (length,) = struct.unpack("!I", header[len(MAGIC):])
+                if length > MAX_PAYLOAD + 512:  # 密文比明文多 nonce/tag/头部
                     return
-                payload = recv_exact(conn, length)
-                if not hmac.compare_digest(sig, sign(self.secret, payload)):
+                blob = recv_exact(conn, length)
+                opened = self._open_checked(blob)
+                if opened is None:
                     return
-                msg = json.loads(payload)
-                if msg.get("id") == NODE_ID:
-                    return
-                if msg.get("type") not in ("text", "image") \
-                        or not isinstance(msg.get("data"), str):
+                _, body = opened
+                if len(body) < 1 or body[0] not in (KIND_TEXT, KIND_IMAGE):
                     return
                 if self.paused:
                     return
-                h = hashlib.sha256(msg["data"].encode("utf-8")).hexdigest()
+                data = body[1:]
+                h = hashlib.sha256(data).digest()
                 with self.lock:
                     if h == self.last_hash:
                         return
                     self.last_hash = h
-                self.bridge.remote_clip.emit(msg)
-                kind = "图片" if msg["type"] == "image" else "文本"
-                self.bridge.status.emit(f"收到{kind} 来自 {addr[0]}")
+                is_image = body[0] == KIND_IMAGE
+                self.bridge.remote_clip.emit(
+                    {"type": "image" if is_image else "text", "data": data})
+                self.bridge.status.emit(
+                    f"收到{'图片' if is_image else '文本'} 来自 {addr[0]}")
         except (ConnectionError, socket.timeout, ValueError, OSError):
             pass
 
     # ---- 发送 ----
 
-    def broadcast(self, kind: str, data: str):
-        """kind: 'text' 或 'image'(PNG base64)。在主线程调用, 网络发送在子线程。"""
+    def broadcast(self, kind: int, data: bytes):
+        """kind: KIND_TEXT / KIND_IMAGE (PNG 原始字节)。
+        在主线程调用, 网络发送在子线程。"""
         if self.paused:
             return
-        h = hashlib.sha256(data.encode("utf-8")).hexdigest()
+        h = hashlib.sha256(data).digest()
         with self.lock:
             if h == self.last_hash:
                 return  # 是我们自己刚设置的内容, 跳过
@@ -210,10 +251,10 @@ class SyncEngine:
             targets = [ip for ip, _ in self.peers.values()]
         if not targets:
             return
-        payload = json.dumps(
-            {"id": NODE_ID, "type": kind, "data": data}).encode("utf-8")
-        packet = build_packet(self.secret, payload)
-        name = "图片" if kind == "image" else "文本"
+        blob = self._seal(HEADER.pack(time.time(), NODE)
+                          + bytes([kind]) + data)
+        packet = MAGIC + struct.pack("!I", len(blob)) + blob
+        name = "图片" if kind == KIND_IMAGE else "文本"
         self.bridge.status.emit(f"推送{name} 到 {len(targets)} 个节点")
         for ip in targets:
             threading.Thread(target=self._send_to_peer, args=(ip, packet),
@@ -259,7 +300,6 @@ class MainWindow(QWidget):
         super().__init__()
         self.engine = engine
         self.setWindowTitle("Stellar 剪贴板同步")
-        self.setWindowIcon(make_app_icon())
         self.resize(420, 480)
 
         layout = QVBoxLayout(self)
@@ -327,9 +367,11 @@ class MainWindow(QWidget):
 class App:
     def __init__(self, secret: str):
         self.app = QApplication(sys.argv)
-        self.app.setWindowIcon(make_app_icon())
+        icon = make_app_icon()
+        self.app.setWindowIcon(icon)  # 主窗口随 QApplication 继承此图标
         self.app.setQuitOnLastWindowClosed(False)
         self.clipboard = self.app.clipboard()
+        self._applying = False  # 正在把远端内容写入剪贴板, 抑制回环广播
 
         self.bridge = Bridge()
         self.engine = SyncEngine(secret, self.bridge)
@@ -339,7 +381,6 @@ class App:
         self.bridge.peers_changed.connect(self.on_peers_changed)
         self.bridge.status.connect(self.window.append_log)
 
-        icon = make_app_icon()
         self.tray = QSystemTrayIcon(icon)
         menu = QMenu()
         show_action = QAction("显示主窗口", menu)
@@ -369,6 +410,8 @@ class App:
             self.show_window()
 
     def on_local_change(self):
+        if self._applying:
+            return  # 剪贴板变化来自远端同步, 不再广播回去
         mime = self.clipboard.mimeData()
         if mime is None:
             return
@@ -379,21 +422,28 @@ class App:
             buf = QBuffer()
             buf.open(QIODevice.WriteOnly)
             image.save(buf, "PNG")
-            data = base64.b64encode(bytes(buf.data())).decode("ascii")
-            self.engine.broadcast("image", data)
+            self.engine.broadcast(KIND_IMAGE, bytes(buf.data()))
         elif mime.hasText():
             text = mime.text()
             if text:
-                self.engine.broadcast("text", text)
+                self.engine.broadcast(KIND_TEXT, text.encode("utf-8"))
 
     def apply_remote(self, msg: dict):
-        if msg["type"] == "text":
-            self.clipboard.setText(msg["data"])
-        else:
-            raw = base64.b64decode(msg["data"])
-            image = QImage.fromData(raw, "PNG")
-            if not image.isNull():
-                self.clipboard.setImage(image)
+        self._applying = True
+        try:
+            if msg["type"] == "text":
+                self.clipboard.setText(msg["data"].decode("utf-8", "replace"))
+            else:
+                image = QImage.fromData(msg["data"], "PNG")
+                if not image.isNull():
+                    self.clipboard.setImage(image)
+        finally:
+            # dataChanged 可能同步触发, 也可能经事件队列; 用零延时定时器
+            # 在这些事件处理完之后再解除抑制
+            QTimer.singleShot(0, self._clear_applying)
+
+    def _clear_applying(self):
+        self._applying = False
 
     def on_peers_changed(self, ips: list):
         self.window.update_peers(ips)
@@ -415,8 +465,9 @@ class App:
 
 def main():
     parser = argparse.ArgumentParser(description="局域网剪贴板同步 (Qt 版)")
-    parser.add_argument("--secret", default="stellar-clipboard",
-                        help="共享口令, 所有机器必须一致 (默认: stellar-clipboard)")
+    parser.add_argument("--secret", required=True,
+                        help="共享口令, 所有机器必须一致; 剪贴板可能包含密码等"
+                             "敏感内容, 请使用足够复杂的口令")
     args = parser.parse_args()
     sys.exit(App(args.secret).run())
 
