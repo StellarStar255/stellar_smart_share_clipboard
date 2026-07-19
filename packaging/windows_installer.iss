@@ -30,5 +30,6 @@ Source: "..\dist\StellarClipboard.exe"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\Stellar Clipboard"; Filename: "{app}\StellarClipboard.exe"
 Name: "{autodesktop}\Stellar Clipboard"; Filename: "{app}\StellarClipboard.exe"
 
+; 不加 skipifsilent: 应用内静默升级 (/SILENT) 完成后也要自动重启程序
 [Run]
-Filename: "{app}\StellarClipboard.exe"; Description: "Launch Stellar Clipboard"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\StellarClipboard.exe"; Description: "Launch Stellar Clipboard"; Flags: nowait postinstall

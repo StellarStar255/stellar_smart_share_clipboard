@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -388,12 +388,25 @@ def _asset_suffix() -> str:
     return ".deb"
 
 
+class _DownloadCancelled(Exception):
+    pass
+
+
 class Updater(QObject):
     """检查 GitHub Releases 新版本并下载对应平台的安装包。"""
     update_available = Signal(str, str, str)  # version, notes, download_url
     up_to_date = Signal(bool)                 # manual: 是否弹窗提示
+    progress = Signal(int, int)               # 已下载字节, 总字节 (未知为 0)
+    cancelled = Signal()
     downloaded = Signal(str)                  # 安装包本地路径
     failed = Signal(str, bool)                # message, manual
+
+    def __init__(self):
+        super().__init__()
+        self._cancel = False
+
+    def cancel_download(self):
+        self._cancel = True
 
     def check_async(self, manual: bool):
         threading.Thread(target=self._check, args=(manual,),
@@ -428,21 +441,89 @@ class Updater(QObject):
                          daemon=True).start()
 
     def _download(self, url: str):
+        self._cancel = False
+        dest = os.path.join(tempfile.gettempdir(), url.rsplit("/", 1)[-1])
         try:
-            dest = os.path.join(tempfile.gettempdir(), url.rsplit("/", 1)[-1])
             req = urllib.request.Request(
                 url, headers={"User-Agent": "stellar-clipboard"})
             with urllib.request.urlopen(req, timeout=60,
                                         context=SSL_CONTEXT) as resp, \
                     open(dest, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
                 while True:
                     chunk = resp.read(256 * 1024)
                     if not chunk:
                         break
+                    if self._cancel:
+                        raise _DownloadCancelled
                     f.write(chunk)
+                    done += len(chunk)
+                    self.progress.emit(done, total)
             self.downloaded.emit(dest)
+        except _DownloadCancelled:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            self.cancelled.emit()
         except Exception as e:
             self.failed.emit(f"下载更新失败: {e}", True)
+
+
+# 独立于主进程的安装脚本: 等应用退出 -> 挂载 dmg -> 原子替换 .app -> 重启。
+# 先复制到 TARGET.update 再交换, 避免复制中途失败留下残缺安装。
+MAC_UPDATE_SCRIPT = """#!/bin/sh
+PID="$1"; DMG="$2"; TARGET="$3"
+exec >>"${TMPDIR:-/tmp}/stellar_update.log" 2>&1
+while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
+MNT=$(mktemp -d)
+hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" || exit 1
+APP=$(ls -d "$MNT"/*.app | head -1)
+NEW="$TARGET.update"
+rm -rf "$NEW"
+if ditto "$APP" "$NEW"; then
+    rm -rf "$TARGET" && mv "$NEW" "$TARGET"
+fi
+hdiutil detach "$MNT" -quiet
+rm -f "$DMG"
+open "$TARGET"
+"""
+
+# 等应用退出 -> pkexec (系统授权弹窗) 安装 deb -> 重启; 无 pkexec 时回退软件中心
+LINUX_UPDATE_SCRIPT = """#!/bin/sh
+PID="$1"; DEB="$2"; BIN="$3"
+exec >>"${TMPDIR:-/tmp}/stellar_update.log" 2>&1
+while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
+if command -v pkexec >/dev/null 2>&1 && pkexec dpkg -i "$DEB"; then
+    rm -f "$DEB"
+    setsid "$BIN" >/dev/null 2>&1 &
+else
+    xdg-open "$DEB" || true
+fi
+"""
+
+
+def _mac_bundle_path():
+    """当前运行的 .app 包路径; 非打包运行时返回 None。"""
+    if not getattr(sys, "frozen", False):
+        return None
+    p = os.path.abspath(sys.executable)
+    while p != "/":
+        if p.endswith(".app"):
+            return p
+        p = os.path.dirname(p)
+    return None
+
+
+def _spawn_update_script(template: str, package_path: str, target: str):
+    script = os.path.join(tempfile.gettempdir(), "stellar_update.sh")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(template)
+    os.chmod(script, 0o755)
+    subprocess.Popen(["/bin/sh", script, str(os.getpid()),
+                      package_path, target],
+                     start_new_session=True)
 
 
 class SecretDialog(QDialog):
@@ -592,9 +673,12 @@ class App:
         self._install_sigint_handler()
 
         self.updater = Updater()
+        self._progress = None
         self.updater.update_available.connect(self.on_update_available)
         self.updater.up_to_date.connect(self.on_up_to_date)
         self.updater.failed.connect(self.on_update_failed)
+        self.updater.progress.connect(self.on_update_progress)
+        self.updater.cancelled.connect(self.on_update_cancelled)
         self.updater.downloaded.connect(self.on_update_downloaded)
         QTimer.singleShot(5000, lambda: self.updater.check_async(False))
 
@@ -610,7 +694,35 @@ class App:
         box.exec()
         if box.clickedButton() is yes:
             self.window.append_log(f"正在下载 v{version} 安装包…")
+            from PySide6.QtWidgets import QProgressDialog
+            self._progress = QProgressDialog(
+                "正在下载更新…", "取消", 0, 100, self.window)
+            self._progress.setWindowTitle(f"下载 v{version}")
+            self._progress.setMinimumDuration(0)
+            self._progress.setValue(0)
+            self._progress.canceled.connect(self.updater.cancel_download)
             self.updater.download_async(url)
+
+    def on_update_progress(self, done: int, total: int):
+        if self._progress is None:
+            return
+        if total > 0:
+            self._progress.setMaximum(100)
+            self._progress.setValue(min(99, done * 100 // total))
+            self._progress.setLabelText(
+                f"正在下载更新… {done / 1e6:.0f} / {total / 1e6:.0f} MB")
+        else:
+            self._progress.setMaximum(0)  # 总大小未知时显示忙碌动画
+
+    def _close_progress(self):
+        if self._progress is not None:
+            self._progress.canceled.disconnect(self.updater.cancel_download)
+            self._progress.close()
+            self._progress = None
+
+    def on_update_cancelled(self):
+        self._close_progress()
+        self.window.append_log("已取消下载")
 
     def on_up_to_date(self, manual: bool):
         self.window.append_log(f"已是最新版本 v{APP_VERSION}")
@@ -619,17 +731,34 @@ class App:
                                     f"当前已是最新版本 (v{APP_VERSION})")
 
     def on_update_failed(self, message: str, manual: bool):
+        self._close_progress()
         self.window.append_log(message)
         if manual:
             QMessageBox.warning(self.window, "检查更新", message)
 
     def on_update_downloaded(self, path: str):
-        self.window.append_log("下载完成, 即将启动安装程序并退出…")
+        self._close_progress()
         if sys.platform == "darwin":
+            target = _mac_bundle_path()
+            if target and os.access(os.path.dirname(target), os.W_OK):
+                self.window.append_log("下载完成, 退出后自动替换安装并重启…")
+                _spawn_update_script(MAC_UPDATE_SCRIPT, path, target)
+                QTimer.singleShot(500, self.app.quit)
+                return
+            # 源码运行或安装目录不可写: 退回打开 dmg 手动安装
+            self.window.append_log("下载完成, 请把应用拖入 Applications 完成安装")
             subprocess.Popen(["open", path])
         elif sys.platform.startswith("win"):
-            os.startfile(path)
+            self.window.append_log("下载完成, 静默安装后将自动重启…")
+            subprocess.Popen([path, "/SILENT", "/FORCECLOSEAPPLICATIONS"])
         else:
+            if getattr(sys, "frozen", False):
+                self.window.append_log("下载完成, 退出后请在系统弹窗中授权安装, "
+                                       "完成后自动重启…")
+                _spawn_update_script(LINUX_UPDATE_SCRIPT, path, sys.executable)
+                QTimer.singleShot(500, self.app.quit)
+                return
+            self.window.append_log("下载完成, 请手动安装")
             subprocess.Popen(["xdg-open", path])
         QTimer.singleShot(800, self.app.quit)
 
