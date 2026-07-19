@@ -3,7 +3,13 @@
 在同一局域网内的 Mac 和 Windows (以及 Linux) 之间同步剪贴板。
 无需服务器, 各机器自动互相发现, 点对点直传。
 
-## 使用方法
+## 安装包 (推荐)
+
+到 [Releases](https://github.com/StellarStar255/stellar_smart_share_clipboard/releases/latest)
+下载对应平台的安装包: macOS `.dmg` / Windows `-setup.exe` / Ubuntu `.deb`,
+一键安装; 之后可在托盘菜单"检查更新"里一键升级。
+
+## 从源码运行
 
 两台电脑上都安装依赖并运行同一个脚本:
 

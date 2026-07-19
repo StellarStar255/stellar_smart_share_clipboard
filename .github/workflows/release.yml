@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build app bundle
+        run: |
+          pyinstaller --noconfirm --windowed --name StellarClipboard \
+            --icon assets/icon.icns \
+            --add-data "assets:assets" \
+            --osx-bundle-identifier com.stellar.clipboard \
+            clipboard_share_qt.py
+      - name: Package DMG
+        run: |
+          mkdir dmgroot
+          cp -R dist/StellarClipboard.app dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname StellarClipboard -srcfolder dmgroot \
+            -ov -format UDZO "StellarClipboard-${GITHUB_REF_NAME}-macos.dmg"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: StellarClipboard-*-macos.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name StellarClipboard
+          --icon assets/icon.ico --add-data "assets;assets"
+          clipboard_share_qt.py
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=$ver packaging\windows_installer.iss
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/StellarClipboard-*-windows-setup.exe
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 \
+            libxcb-cursor0 libdbus-1-3 libfontconfig1
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build binary
+        run: |
+          pyinstaller --noconfirm --name stellar-clipboard \
+            --add-data "assets:assets" clipboard_share_qt.py
+      - name: Build deb package
+        run: bash packaging/build_deb.sh "${GITHUB_REF_NAME#v}"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb

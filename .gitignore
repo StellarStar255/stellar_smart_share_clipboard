@@ -43,3 +43,7 @@ GetNewPython.py
 .DS_Store
 
 .images/
+# packaging outputs
+build/
+dist/
+*.spec

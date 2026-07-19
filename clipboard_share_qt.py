@@ -23,14 +23,18 @@
 import argparse
 import getpass
 import hashlib
+import json
 import os
 import queue
 import signal
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 
 try:
@@ -40,9 +44,15 @@ except ImportError:
 
 from PySide6.QtCore import (QBuffer, QIODevice, QObject, Qt, QTimer, Signal)
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel,
-                               QListWidget, QMenu, QPlainTextEdit,
-                               QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
+                               QDialogButtonBox, QHBoxLayout, QLabel,
+                               QLineEdit, QListWidget, QMenu, QMessageBox,
+                               QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
+                               QWidget)
+
+APP_VERSION = "2.0.0"
+GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
+UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 DISCOVERY_PORT = 48765
 TRANSFER_PORT = 48766
@@ -323,8 +333,14 @@ class SyncEngine:
                 self.bridge.status.emit(f"发送到 {ip} 失败: {e}")
 
 
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "assets", "stellar_smart_share_clipboard.png")
+def resource_path(*parts) -> str:
+    """兼容 PyInstaller 打包 (资源解压到 sys._MEIPASS)。"""
+    base = getattr(sys, "_MEIPASS",
+                   os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
+
+
+ICON_PATH = resource_path("assets", "stellar_smart_share_clipboard.png")
 
 
 def make_app_icon() -> QPixmap:
@@ -348,13 +364,105 @@ def make_app_icon() -> QPixmap:
     return pix
 
 
+def _version_key(v: str):
+    nums = []
+    for part in v.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        nums.append(int(digits) if digits else 0)
+    return tuple((nums + [0, 0, 0])[:3])
+
+
+def _asset_suffix() -> str:
+    if sys.platform == "darwin":
+        return ".dmg"
+    if sys.platform.startswith("win"):
+        return ".exe"
+    return ".deb"
+
+
+class Updater(QObject):
+    """检查 GitHub Releases 新版本并下载对应平台的安装包。"""
+    update_available = Signal(str, str, str)  # version, notes, download_url
+    up_to_date = Signal(bool)                 # manual: 是否弹窗提示
+    downloaded = Signal(str)                  # 安装包本地路径
+    failed = Signal(str, bool)                # message, manual
+
+    def check_async(self, manual: bool):
+        threading.Thread(target=self._check, args=(manual,),
+                         daemon=True).start()
+
+    def _check(self, manual: bool):
+        try:
+            req = urllib.request.Request(
+                UPDATE_API, headers={"User-Agent": "stellar-clipboard"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                info = json.load(resp)
+            latest = info.get("tag_name", "").lstrip("vV")
+            if not latest or _version_key(latest) <= _version_key(APP_VERSION):
+                self.up_to_date.emit(manual)
+                return
+            suffix = _asset_suffix()
+            url = next((a["browser_download_url"]
+                        for a in info.get("assets", [])
+                        if a["name"].endswith(suffix)), None)
+            if not url:
+                self.failed.emit(
+                    f"新版本 v{latest} 暂无本平台 ({suffix}) 安装包", manual)
+                return
+            self.update_available.emit(
+                latest, (info.get("body") or "")[:4000], url)
+        except Exception as e:
+            self.failed.emit(f"检查更新失败: {e}", manual)
+
+    def download_async(self, url: str):
+        threading.Thread(target=self._download, args=(url,),
+                         daemon=True).start()
+
+    def _download(self, url: str):
+        try:
+            dest = os.path.join(tempfile.gettempdir(), url.rsplit("/", 1)[-1])
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "stellar-clipboard"})
+            with urllib.request.urlopen(req, timeout=60) as resp, \
+                    open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            self.downloaded.emit(dest)
+        except Exception as e:
+            self.failed.emit(f"下载更新失败: {e}", True)
+
+
+class SecretDialog(QDialog):
+    """打包运行 (无终端) 时的口令输入框。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stellar 剪贴板同步")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("请输入共享口令 (所有机器必须一致):"))
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.edit)
+        self.remember = QCheckBox("在本机记住口令 (明文保存, 仅当前用户可读)")
+        self.remember.setChecked(True)
+        layout.addWidget(self.remember)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class MainWindow(QWidget):
     """主窗口: 状态 / 在线节点 / 同步记录。关闭时隐藏到托盘, 不退出。"""
 
     def __init__(self, engine: SyncEngine, secret: str):
         super().__init__()
         self.engine = engine
-        self.setWindowTitle("Stellar 剪贴板同步")
+        self.setWindowTitle(f"Stellar 剪贴板同步 v{APP_VERSION}")
         self.resize(420, 480)
 
         layout = QVBoxLayout(self)
@@ -421,11 +529,23 @@ class MainWindow(QWidget):
 
 
 class App:
-    def __init__(self, secret: str):
+    def __init__(self, secret):
         self.app = QApplication(sys.argv)
         icon = make_app_icon()
         self.app.setWindowIcon(icon)  # 主窗口随 QApplication 继承此图标
         self.app.setQuitOnLastWindowClosed(False)
+
+        if not secret:  # 打包运行时没有终端, 用对话框要口令
+            dlg = SecretDialog()
+            if dlg.exec() != QDialog.Accepted or not dlg.edit.text():
+                sys.exit(1)
+            secret = dlg.edit.text()
+            if dlg.remember.isChecked():
+                try:
+                    save_secret(secret)
+                except OSError:
+                    pass
+
         self.clipboard = self.app.clipboard()
         self._applying = False  # 正在把远端内容写入剪贴板, 抑制回环广播
 
@@ -446,6 +566,10 @@ class App:
         self.peer_action.setEnabled(False)
         menu.addAction(self.peer_action)
         menu.addSeparator()
+        update_action = QAction("检查更新", menu)
+        update_action.triggered.connect(
+            lambda: self.updater.check_async(True))
+        menu.addAction(update_action)
         quit_action = QAction("退出", menu)
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
@@ -456,6 +580,48 @@ class App:
 
         self.clipboard.dataChanged.connect(self.on_local_change)
         self._install_sigint_handler()
+
+        self.updater = Updater()
+        self.updater.update_available.connect(self.on_update_available)
+        self.updater.up_to_date.connect(self.on_up_to_date)
+        self.updater.failed.connect(self.on_update_failed)
+        self.updater.downloaded.connect(self.on_update_downloaded)
+        QTimer.singleShot(5000, lambda: self.updater.check_async(False))
+
+    def on_update_available(self, version: str, notes: str, url: str):
+        box = QMessageBox(self.window)
+        box.setWindowTitle("发现新版本")
+        box.setText(f"发现新版本 v{version} (当前 v{APP_VERSION})。"
+                    f"是否下载并安装?")
+        if notes:
+            box.setDetailedText(notes)
+        yes = box.addButton("下载并安装", QMessageBox.AcceptRole)
+        box.addButton("暂不", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self.window.append_log(f"正在下载 v{version} 安装包…")
+            self.updater.download_async(url)
+
+    def on_up_to_date(self, manual: bool):
+        self.window.append_log(f"已是最新版本 v{APP_VERSION}")
+        if manual:
+            QMessageBox.information(self.window, "检查更新",
+                                    f"当前已是最新版本 (v{APP_VERSION})")
+
+    def on_update_failed(self, message: str, manual: bool):
+        self.window.append_log(message)
+        if manual:
+            QMessageBox.warning(self.window, "检查更新", message)
+
+    def on_update_downloaded(self, path: str):
+        self.window.append_log("下载完成, 即将启动安装程序并退出…")
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif sys.platform.startswith("win"):
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+        QTimer.singleShot(800, self.app.quit)
 
     def _install_sigint_handler(self):
         """终端里连按两次 Ctrl+C (2 秒内) 退出程序。"""
@@ -527,18 +693,36 @@ class App:
         try:
             self.engine.start()
         except RuntimeError as e:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(None, "无法启动", str(e))
             return 1
         self.window.show()
-        self.window.append_log(f"已启动, 本机节点 {NODE_ID[:8]}")
+        self.window.append_log(f"已启动 v{APP_VERSION}, 本机节点 {NODE_ID[:8]}")
         self.window.append_log("等待发现同网段节点…")
         return self.app.exec()
 
 
+SECRET_FILE = os.path.expanduser("~/.stellar_clipboard_secret")
+
+
+def load_saved_secret():
+    try:
+        with open(SECRET_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def save_secret(secret: str):
+    fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(secret)
+
+
 def resolve_secret(cli_secret):
-    """按 --secret > 环境变量 SSSC_SECRET > 交互输入 的顺序取口令。"""
-    secret = cli_secret or os.environ.get("SSSC_SECRET")
+    """--secret > 环境变量 SSSC_SECRET > 本机保存的口令 > 终端交互输入。
+    都没有时返回 None, 由 App 弹 GUI 对话框输入。"""
+    secret = (cli_secret or os.environ.get("SSSC_SECRET")
+              or load_saved_secret())
     if not secret and sys.stdin is not None and sys.stdin.isatty():
         secret = getpass.getpass("请输入共享口令 (输入不回显): ")
     return secret
@@ -550,12 +734,10 @@ def main():
                         help="共享口令, 所有机器必须一致, 请使用足够复杂的口令。"
                              "为避免泄露到 shell 历史和进程列表, 推荐改用"
                              "环境变量 SSSC_SECRET 或留空后交互输入")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {APP_VERSION}")
     args = parser.parse_args()
-    secret = resolve_secret(args.secret)
-    if not secret:
-        parser.error("需要口令: 通过 --secret、环境变量 SSSC_SECRET "
-                     "或交互输入提供")
-    sys.exit(App(secret).run())
+    sys.exit(App(resolve_secret(args.secret)).run())
 
 
 if __name__ == "__main__":
