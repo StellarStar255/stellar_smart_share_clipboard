@@ -1,18 +1,18 @@
-# Stellar Clipboard v2.0.1
+# Stellar Clipboard v2.0.2
 
 ## 中文
 
 修复版本。
 
-- **修复安装包内"检查更新"报 SSL 证书错误**
-  (`CERTIFICATE_VERIFY_FAILED`):打包后的应用找不到系统 CA 证书库,
-  现已捆绑 certifi 证书。从本版本起应用内一键升级可正常工作。
+- **修复 Ubuntu (Wayland) 上本机复制不同步的问题**:Ubuntu 22.04+ 默认的
+  Wayland 会话禁止后台应用监听剪贴板,导致 Ubuntu → 其他机器方向失效
+  (接收方向不受影响)。现在程序会自动改走 XWayland (xcb),后台监听恢复
+  正常;X11 会话及 macOS / Windows 行为不变。
+- 启动日志显示实际使用的图形后端;若仍运行在 Wayland 后端会给出
+  明确警告与解决指引。
 
-> 已安装 v2.0.0 的用户:该版本的更新检查因此 bug 无法使用,
-> 请手动下载本版本安装一次,之后即可应用内升级。
-
-安装方法与注意事项同 v2.0.0(macOS 未签名应用需右键 → 打开;
-所有机器使用相同口令;防火墙放行 UDP 48765 / TCP 48766)。
+已安装 v2.0.1 的用户可直接在托盘菜单"检查更新"一键升级。
+(v2.0.0 用户请手动下载安装,该版本的更新检查有 SSL 缺陷。)
 
 ---
 
@@ -20,15 +20,15 @@
 
 Bugfix release.
 
-- **Fix SSL certificate error in the packaged app's update check**
-  (`CERTIFICATE_VERIFY_FAILED`): the bundled Python could not find the
-  system CA store; certifi certificates are now bundled. In-app one-click
-  updates work from this version onward.
+- **Fix local copies not syncing out on Ubuntu (Wayland)**: the default
+  Wayland session on Ubuntu 22.04+ forbids background apps from monitoring
+  the clipboard, breaking the Ubuntu → others direction (receiving was
+  unaffected). The app now runs via XWayland (xcb) automatically, restoring
+  background clipboard monitoring; X11 sessions, macOS and Windows are
+  unchanged.
+- The startup log now shows the graphics backend in use, with a clear
+  warning and instructions if the app still ends up on the Wayland backend.
 
-> If you installed v2.0.0: its update check is broken by this bug —
-> please download and install this version manually once; future
-> upgrades can then be done in-app.
-
-Installation and notes are the same as v2.0.0 (unsigned macOS app needs
-right-click → Open; use the same passphrase on all machines; allow
-UDP 48765 / TCP 48766 through the firewall).
+Users on v2.0.1 can upgrade in one click via "Check for updates" in the
+tray menu. (v2.0.0 users: please download manually — that version's update
+check is broken by an SSL bug.)
