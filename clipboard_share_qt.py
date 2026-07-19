@@ -252,6 +252,9 @@ class SyncEngine:
             self.peers.clear()
             self._nonces.clear()
             self._gossip.clear()
+        # peers 已清空, 不会再走 announce 循环的超时下线路径,
+        # 在这里回收旧节点的发送线程和长连接 (内部拿锁, 不能在上面锁内调)
+        self._retire_dead_senders()
         self.bridge.peers_changed.emit([])
         self.bridge.status.emit("口令已更换, 等待与使用新口令的节点重新配对…")
 
@@ -264,7 +267,7 @@ class SyncEngine:
             self._srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._srv_sock.bind(("", TRANSFER_PORT))
-            self._srv_sock.listen(8)
+            self._srv_sock.listen(MAX_CONNECTIONS)
         except OSError as e:
             raise RuntimeError(
                 f"端口被占用 (UDP {DISCOVERY_PORT} / TCP {TRANSFER_PORT})。\n"
@@ -382,6 +385,7 @@ class SyncEngine:
         try:
             with conn:
                 conn.settimeout(60)
+                bad = 0  # 连续解密失败计数
                 # 对端复用同一连接连续发送多条消息 (见 _send_loop);
                 # 空闲 60 秒超时关闭, 释放连接槽位, 对端下次发送时会重连
                 while True:
@@ -397,7 +401,13 @@ class SyncEngine:
                     blob = recv_exact(conn, length)
                     opened = self._open_checked(blob)
                     if opened is None:
-                        continue  # 单条消息异常不必断开整个连接
+                        # 偶发失败 (时间偏差/重放) 可容忍; 连续失败说明
+                        # 对端口令已不同 (如本机刚换口令), 断开释放槽位
+                        bad += 1
+                        if bad >= 8:
+                            return
+                        continue
+                    bad = 0
                     _, body = opened
                     if len(body) < 1 or body[0] not in (
                             KIND_TEXT, KIND_IMAGE, KIND_TEXT_Z):
