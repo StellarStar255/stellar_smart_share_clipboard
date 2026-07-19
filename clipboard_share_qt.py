@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.6"
+APP_VERSION = "2.0.7"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -248,6 +248,7 @@ class SyncEngine:
                 items = self._peer_items()
             if dead:
                 self.bridge.peers_changed.emit(items)
+                self._retire_dead_senders()
             time.sleep(ANNOUNCE_INTERVAL)
 
     def _discovery_loop(self):
@@ -397,12 +398,31 @@ class SyncEngine:
     def _send_loop(self, ip: str, q: queue.Queue):
         while True:
             packet = q.get()
+            if packet is None:
+                return  # 节点已下线, 退出线程 (见 _retire_dead_senders)
             try:
                 with socket.create_connection((ip, TRANSFER_PORT),
                                               timeout=10) as c:
                     c.sendall(packet)
             except OSError as e:
                 self.bridge.status.emit(f"发送到 {ip} 失败: {e}")
+
+    def _retire_dead_senders(self):
+        """回收已不再是发送目标的节点的发送线程, 避免 IP 长期变动时累积。
+        目标 = 已知节点 ∪ 手动节点 ∪ gossip 学到的节点。"""
+        with self.lock:
+            live = ({ip for ip, _, _ in self.peers.values()}
+                    | self.manual_peers | set(self._gossip))
+            stale = [(ip, self._senders.pop(ip))
+                     for ip in list(self._senders) if ip not in live]
+        for _, q in stale:
+            # 该队列已从 _senders 移除, 不会再有新内容入队, 可安全清空并投退出信号
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+            q.put_nowait(None)
 
 
 def resource_path(*parts) -> str:
@@ -888,7 +908,11 @@ class App:
         QTimer.singleShot(800, self.app.quit)
 
     def _install_sigint_handler(self):
-        """终端里连按两次 Ctrl+C (2 秒内) 退出程序。"""
+        """终端里连按两次 Ctrl+C (2 秒内) 退出程序。
+        打包成 GUI 应用时没有终端, 直接跳过——既省去无用的信号处理,
+        也避免那个每 200ms 空转的定时器。"""
+        if not (sys.stdin is not None and sys.stdin.isatty()):
+            return
         self._sigint_at = 0.0
 
         def handler(signum, frame):
