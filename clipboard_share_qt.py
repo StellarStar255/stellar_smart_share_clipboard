@@ -51,7 +51,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.0.5"
+APP_VERSION = "2.0.6"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -412,7 +412,10 @@ def resource_path(*parts) -> str:
     return os.path.join(base, *parts)
 
 
-ICON_PATH = resource_path("assets", "stellar_smart_share_clipboard.png")
+# 优先用带标准边距的图标 (窗口/托盘与 Dock 的 .icns 视觉一致), 缺失时回退原图
+ICON_PATH = resource_path("assets", "icon_padded.png")
+if not os.path.exists(ICON_PATH):
+    ICON_PATH = resource_path("assets", "stellar_smart_share_clipboard.png")
 
 
 def make_app_icon() -> QPixmap:
