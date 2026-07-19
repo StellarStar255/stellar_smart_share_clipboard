@@ -21,6 +21,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import socket
 import struct
 import sys
@@ -226,7 +227,15 @@ class SyncEngine:
             self.bridge.status.emit(f"发送到 {ip} 失败: {e}")
 
 
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "assets", "stellar_smart_share_clipboard.png")
+
+
 def make_app_icon() -> QPixmap:
+    pix = QPixmap(ICON_PATH)
+    if not pix.isNull():
+        return pix
+    # 图标文件缺失时回退到程序绘制的图标
     pix = QPixmap(64, 64)
     pix.fill(Qt.transparent)
     p = QPainter(pix)
@@ -318,6 +327,7 @@ class MainWindow(QWidget):
 class App:
     def __init__(self, secret: str):
         self.app = QApplication(sys.argv)
+        self.app.setWindowIcon(make_app_icon())
         self.app.setQuitOnLastWindowClosed(False)
         self.clipboard = self.app.clipboard()
 
