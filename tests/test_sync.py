@@ -204,6 +204,20 @@ class TestReceiver(unittest.TestCase):
                          [b"hello", b"world"])
         self.assertEqual(len(self.push._senders), 1)  # 单发送线程/长连接
 
+    def test_dedup_expires_so_same_content_received_again(self):
+        """去重只在 DEDUP_TTL 内生效: 对端剪贴板被覆盖后重新复制的
+        同一内容, 必须能再次送达 (曾被无时效的去重永远丢弃)。"""
+        old_ttl = m.DEDUP_TTL
+        self.addCleanup(setattr, m, "DEDUP_TTL", old_ttl)
+        m.DEDUP_TTL = 0.5
+        self.send(m.KIND_TEXT, b"same")
+        self.send(m.KIND_TEXT, b"same")   # TTL 内的重复, 去重
+        self.assertTrue(wait_for(lambda: len(self.got()) == 1))
+        time.sleep(0.8)                   # 超过 TTL
+        self.assertEqual(len(self.got()), 1)
+        self.send(m.KIND_TEXT, b"same")   # 用户重新复制
+        self.assertTrue(wait_for(lambda: len(self.got()) == 2))
+
     def test_pause_discards_then_same_conn_resumes(self):
         self.recv.paused = True
         self.send(m.KIND_TEXT, b"skipped")
@@ -379,6 +393,24 @@ class TestDispatch(unittest.TestCase):
             finally:
                 m.MAX_PAYLOAD = old_max
             self.assertEqual(len(self.wire), 1)
+
+    def test_dedup_expires_so_recopy_resends(self):
+        """发送端同理: 重新复制同一文件, TTL 过后必须重新发送。"""
+        old_ttl = m.DEDUP_TTL
+        self.addCleanup(setattr, m, "DEDUP_TTL", old_ttl)
+        m.DEDUP_TTL = 0.5
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "重试.txt")
+            with open(p, "w") as f:
+                f.write("same-content")
+            self.sender.submit(m.KIND_FILES, [p])
+            self.assertTrue(wait_for(lambda: len(self.wire) == 1))
+            self.sender.submit(m.KIND_FILES, [p])  # TTL 内重复, 去重
+            time.sleep(0.8)                        # 超过 TTL
+            self.assertEqual(len(self.wire), 1)
+            self.sender.submit(m.KIND_FILES, [p])  # 重新复制 -> 重发
+            self.assertTrue(wait_for(lambda: len(self.wire) == 2))
+            self.assertEqual(self.wire[1][0], m.KIND_FILES)
 
     def test_image_encode_cache_and_dedup(self):
         img = solid_image("teal", 64)

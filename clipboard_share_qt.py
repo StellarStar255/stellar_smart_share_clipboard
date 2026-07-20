@@ -57,7 +57,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog,
                                QPlainTextEdit, QSystemTrayIcon, QVBoxLayout,
                                QWidget)
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 GITHUB_REPO = "StellarStar255/stellar_smart_share_clipboard"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -87,6 +87,11 @@ TIME_WINDOW = 30.0              # 消息时间戳容忍偏差 (秒), 防重放
 # TCP 并发接收上限, 防内存耗尽; 发送方保持长连接, 每个在线节点长期占用一个
 MAX_CONNECTIONS = 16
 SEND_QUEUE_MAX = 16             # 每节点待发送队列上限, 满时丢弃最旧内容
+# 内容去重的时效: 只拦截短时间内的重复 (macOS 一次复制多次触发
+# dataChanged / 刚收到的内容经竞态绕过 _applying 回流)。超过时效的
+# 相同内容视为用户主动重新复制 (如对端剪贴板被覆盖后想再同步一次),
+# 必须正常发送 —— 无时效的去重曾让同一文件的重试永远被静默丢弃
+DEDUP_TTL = 5.0
 
 NODE = uuid.uuid4().bytes       # 本机节点标识 (16 字节)
 NODE_ID = NODE.hex()
@@ -289,6 +294,7 @@ class SyncEngine:
         self.peers = {}          # node_id -> (ip, last_seen, hostname)
         self._gossip = {}        # 从节点名单学到的 ip -> expiry
         self.last_hash = None    # 最近同步内容的哈希, 防回环
+        self._hash_seen = 0.0    # last_hash 的记录时间, 去重只在 DEDUP_TTL 内生效
         self.paused = False
         self._nonces = {}        # nonce -> seen_at, 防重放
         self._skew_warned = 0.0  # 上次时钟偏差告警时间, 避免刷屏
@@ -506,10 +512,12 @@ class SyncEngine:
                             continue
                     # 去重哈希对解压后的内容计算, 与发送端一致
                     h = hashlib.sha256(data).digest()
+                    now = time.time()
                     with self.lock:
-                        if h == self.last_hash:
+                        if h == self.last_hash and now - self._hash_seen < DEDUP_TTL:
                             continue
                         self.last_hash = h
+                        self._hash_seen = now
                     if body[0] == KIND_IMAGE:
                         # 在网络线程解码, 大图不卡界面线程
                         image = QImage.fromData(data, "PNG")
@@ -606,10 +614,12 @@ class SyncEngine:
             else:
                 data = obj.encode("utf-8")
             h = hashlib.sha256(data).digest()
+            now = time.time()
             with self.lock:
-                if h == self.last_hash:
-                    continue  # 是我们自己刚设置的内容, 跳过
+                if h == self.last_hash and now - self._hash_seen < DEDUP_TTL:
+                    continue  # 是我们自己刚设置/刚发出的内容, 跳过
                 self.last_hash = h
+                self._hash_seen = now
                 # peers 按 node_id 记录, 节点重启后旧记录超时前
                 # 同一 IP 会短暂出现两条, 用集合去重
                 targets = {ip for ip, _, _ in self.peers.values()}
